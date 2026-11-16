@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Microsoft.Playwright;
 
-const string profileFileName = "weblm-fingerprint.json";
+const string profileFileName = "fingerprint-local.json";
 const string usage = "Usage: dotnet run --project demo -- <path-to-Chromium> [profile.json]";
 var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true };
 
