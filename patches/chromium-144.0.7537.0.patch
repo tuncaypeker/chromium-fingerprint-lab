@@ -1,0 +1,2553 @@
+diff --git a/base/BUILD.gn b/base/BUILD.gn
+index fbb79f7039c3c628f97370b08581eaba7d15ae31..3c1ffe86c1db02a87fc3b395bd81f9e4e8f529fe 100644
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -208,6 +208,8 @@ component("base") {
+     "base64url.cc",
+     "base64url.h",
+     "base_switches.h",
++    "weblim/fingerprint_config.cc",
++    "weblim/fingerprint_config.h",
+     "big_endian.h",
+     "bit_cast.h",
+     "bits.h",
+diff --git a/base/i18n/icu_util.cc b/base/i18n/icu_util.cc
+index 6e6e12089d71874c7bcb94d590667a38f11bb052..968bdc3494be68f736693b94d7b7c6c06653e711 100644
+--- a/base/i18n/icu_util.cc
++++ b/base/i18n/icu_util.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "base/i18n/icu_util.h"
+ 
++#include "third_party/icu/source/i18n/unicode/timezone.h"
++#include "third_party/icu/source/common/unicode/unistr.h"
++#include "base/command_line.h"
++
+ #include "build/build_config.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -13,21 +17,24 @@
+ #include <string.h>
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/debug/alias.h"
+ #include "base/debug/crash_logging.h"
+-#include "base/environment.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/files/memory_mapped_file.h"
++#include "base/json/json_reader.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/metrics_hashes.h"
+ #include "base/path_service.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/values.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/chromecast_buildflags.h"
+ #include "third_party/icu/source/common/unicode/putil.h"
+ #include "third_party/icu/source/common/unicode/uclean.h"
+@@ -314,6 +321,18 @@ bool InitializeICUFromDataFile() {
+ // On some platforms, the time zone must be explicitly initialized zone rather
+ // than relying on ICU's internal initialization.
+ void InitializeIcuTimeZone() {
++
++  std::string tz =
++      base::weblim::GetFingerprintConfigString("timezone").value_or("");
++
++  if (!tz.empty()) {
++    icu::TimeZone::adoptDefault(
++        icu::TimeZone::createTimeZone(icu::UnicodeString::fromUTF8(tz)));
++
++    // OS timezone detection tamamen bypass; ICU artik spoof edilmis TZ.
++    return;
++  }
++
+ #if BUILDFLAG(IS_FUCHSIA)
+   // The platform-specific mechanisms used by ICU's detectHostTimeZone() to
+   // determine the default time zone will not work on Fuchsia. Therefore,
+diff --git a/base/weblim/fingerprint_config.cc b/base/weblim/fingerprint_config.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a31ad39f150d50d2ae6e563224e58190ee1829e7
+--- /dev/null
++++ b/base/weblim/fingerprint_config.cc
+@@ -0,0 +1,154 @@
++// Copyright 2026 Webilim
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "base/weblim/fingerprint_config.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/synchronization/lock.h"
++#include "base/values.h"
++
++namespace base::weblim {
++namespace {
++
++constexpr char kUserDataDirSwitch[] = "user-data-dir";
++constexpr char kConfigFileName[] = "weblm-fingerprint.json";
++
++class FingerprintConfigCache {
++ public:
++  FingerprintConfigCache() = default;
++  FingerprintConfigCache(const FingerprintConfigCache&) = delete;
++  FingerprintConfigCache& operator=(const FingerprintConfigCache&) = delete;
++
++  std::optional<std::string> GetString(std::string_view key) {
++    base::AutoLock auto_lock(lock_);
++    EnsureLoaded();
++    if (!dict_)
++      return std::nullopt;
++
++    const std::string* value = dict_->FindString(key);
++    if (!value)
++      return std::nullopt;
++    return *value;
++  }
++
++  std::optional<std::string> GetJson(std::string_view key) {
++    base::AutoLock auto_lock(lock_);
++    EnsureLoaded();
++    if (!dict_)
++      return std::nullopt;
++
++    const base::Value* value = dict_->Find(key);
++    if (!value)
++      return std::nullopt;
++
++    std::string json;
++    if (!base::JSONWriter::Write(*value, &json))
++      return std::nullopt;
++    return json;
++  }
++
++  std::optional<int> GetInt(std::string_view key) {
++    base::AutoLock auto_lock(lock_);
++    EnsureLoaded();
++    if (!dict_)
++      return std::nullopt;
++
++    std::optional<int> value = dict_->FindInt(key);
++    if (value)
++      return *value;
++
++    const std::string* string_value = dict_->FindString(key);
++    int parsed = 0;
++    if (string_value && base::StringToInt(*string_value, &parsed))
++      return parsed;
++
++    return std::nullopt;
++  }
++
++  std::optional<double> GetDouble(std::string_view key) {
++    base::AutoLock auto_lock(lock_);
++    EnsureLoaded();
++    if (!dict_)
++      return std::nullopt;
++
++    std::optional<double> value = dict_->FindDouble(key);
++    if (value)
++      return *value;
++
++    const std::string* string_value = dict_->FindString(key);
++    double parsed = 0;
++    if (string_value && base::StringToDouble(*string_value, &parsed))
++      return parsed;
++
++    return std::nullopt;
++  }
++
++ private:
++  void EnsureLoaded() {
++    if (loaded_)
++      return;
++    loaded_ = true;
++
++    const base::CommandLine* command_line =
++        base::CommandLine::ForCurrentProcess();
++    if (!command_line)
++      return;
++
++    base::FilePath user_data_dir =
++        command_line->GetSwitchValuePath(kUserDataDirSwitch);
++    if (user_data_dir.empty())
++      return;
++
++    std::string json;
++    if (!base::ReadFileToString(user_data_dir.AppendASCII(kConfigFileName),
++                                &json)) {
++      return;
++    }
++
++    std::optional<base::Value> parsed =
++        base::JSONReader::Read(json, base::JSON_ALLOW_TRAILING_COMMAS);
++    if (!parsed || !parsed->is_dict())
++      return;
++
++    dict_.emplace(std::move(parsed->GetDict()));
++  }
++
++  base::Lock lock_;
++  bool loaded_ = false;
++  std::optional<base::Value::Dict> dict_;
++};
++
++FingerprintConfigCache& GetCache() {
++  static base::NoDestructor<FingerprintConfigCache> cache;
++  return *cache;
++}
++
++}  // namespace
++
++std::optional<std::string> GetFingerprintConfigString(std::string_view key) {
++  return GetCache().GetString(key);
++}
++
++std::optional<std::string> GetFingerprintConfigJson(std::string_view key) {
++  return GetCache().GetJson(key);
++}
++
++std::optional<int> GetFingerprintConfigInt(std::string_view key) {
++  return GetCache().GetInt(key);
++}
++
++std::optional<double> GetFingerprintConfigDouble(std::string_view key) {
++  return GetCache().GetDouble(key);
++}
++
++}  // namespace base::weblim
+diff --git a/base/weblim/fingerprint_config.h b/base/weblim/fingerprint_config.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c05b03748a7ed1fb9019e05b30fbe45ca631f4ef
+--- /dev/null
++++ b/base/weblim/fingerprint_config.h
+@@ -0,0 +1,20 @@
++// Copyright 2026 Webilim
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef BASE_WEBLIM_FINGERPRINT_CONFIG_H_
++#define BASE_WEBLIM_FINGERPRINT_CONFIG_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace base::weblim {
++
++std::optional<std::string> GetFingerprintConfigString(std::string_view key);
++std::optional<std::string> GetFingerprintConfigJson(std::string_view key);
++std::optional<int> GetFingerprintConfigInt(std::string_view key);
++std::optional<double> GetFingerprintConfigDouble(std::string_view key);
++
++}  // namespace base::weblim
++
++#endif  // BASE_WEBLIM_FINGERPRINT_CONFIG_H_
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 9f972d8d3bd62fc6a11d54922a8461b19532b8b0..fe65a932801d9f70d8e8adbfdc7a937d8b4bb54e 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -23,13 +23,16 @@
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/containers/fixed_flat_set.h"
+ #include "base/dcheck_is_on.h"
++#include "base/environment.h"
+ #include "base/feature_list.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/i18n/base_i18n_switches.h"
+ #include "base/i18n/character_encoding.h"
++#include "base/json/json_reader.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/metrics/field_trial_params.h"
+@@ -48,6 +51,7 @@
+ #include "base/types/expected.h"
+ #include "base/types/expected_macros.h"
+ #include "base/values.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/android_buildflags.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+@@ -3047,6 +3051,13 @@ std::string ChromeContentBrowserClient::GetApplicationLocale() {
+ 
+ std::string ChromeContentBrowserClient::GetAcceptLangs(
+     content::BrowserContext* context) {
++  // ##SPOOF## Locale override without using Chromium's global --lang switch.
++  std::string locale_override =
++      base::weblim::GetFingerprintConfigString("locale").value_or("");
++  if (!locale_override.empty()) {
++    return locale_override;
++  }
++
+   Profile* profile = Profile::FromBrowserContext(context);
+   return profile->GetPrefs()->GetString(language::prefs::kAcceptLanguages);
+ }
+diff --git a/chrome/browser/net/profile_network_context_service.cc b/chrome/browser/net/profile_network_context_service.cc
+index ac8a52ad58a98cc80ee4afb34b0f37278806b492..776fe10b45310d5ec40ac4435587d8bdbef712b7 100644
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/net/profile_network_context_service.h"
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ 
+@@ -14,11 +15,13 @@
+ #include "base/containers/flat_map.h"
+ #include "base/containers/span.h"
+ #include "base/containers/to_vector.h"
++#include "base/environment.h"
+ #include "base/feature_list.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
+ #include "base/metrics/field_trial.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/metrics/histogram_macros.h"
+@@ -31,6 +34,8 @@
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/values.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/build_config.h"
+ #include "build/chromeos_buildflags.h"
+ #include "chrome/browser/browser_features.h"
+@@ -703,6 +708,13 @@ void ProfileNetworkContextService::OnTrackingProtectionEnabledFor3pcdChanged(
+ }
+ 
+ std::string ProfileNetworkContextService::ComputeAcceptLanguage() const {
++  // ##SPOOF## Locale override without using Chromium's global --lang switch.
++  std::string locale_override =
++      base::weblim::GetFingerprintConfigString("locale").value_or("");
++  if (!locale_override.empty()) {
++    return ComputeAcceptLanguageFromPref(locale_override);
++  }
++
+   // TODO:(https://crbug.com/40224802) Return only single language without
+   // expanding the language list if the DisableReduceAcceptLanguage deprecation
+   // trial ends.
+diff --git a/chrome/browser/ui/startup/bad_flags_prompt.cc b/chrome/browser/ui/startup/bad_flags_prompt.cc
+index f2ee6c90a030d44e9dd7e5d55461deef81dba999..dadd17db6ce6e8f24a6ae2f079182a245ce990c6 100644
+--- a/chrome/browser/ui/startup/bad_flags_prompt.cc
++++ b/chrome/browser/ui/startup/bad_flags_prompt.cc
+@@ -70,7 +70,7 @@ namespace {
+ #if !BUILDFLAG(IS_ANDROID)
+ // Dangerous command line flags for which to display a warning that "stability
+ // and security will suffer".
+-const char* const kBadFlags[] = {
++[[maybe_unused]] const char* const kBadFlags[] = {
+     // These flags allow redirecting user traffic.
+     network::switches::kHostResolverRules,
+     network::switches::kHostRules,
+@@ -210,7 +210,7 @@ const char* const kBadFlags[] = {
+ // should be listed in `kBadFlags` above, which is only checked on desktop
+ // platforms. This is because command-line flags cannot be set by users on
+ // non-rooted Android devices, so we avoid showing a warning for them.
+-static const std::variant<const base::Feature*, const char*>
++[[maybe_unused]] static const std::variant<const base::Feature*, const char*>
+     kBadFeatureFlagsInAboutFlags[] = {
+         // This feature enables developer mode support for Isolated Web Apps.
+         &features::kIsolatedWebAppDevMode,
+@@ -245,6 +245,11 @@ void ShowBadFlagsInfoBarHelper(content::WebContents* web_contents,
+ }  // namespace
+ 
+ void ShowBadFlagsPrompt(content::WebContents* web_contents) {
++
++//##SPOOF
++return;
++
++/*
+ // On Android, ShowBadFlagsPrompt doesn't show the warning notification
+ // for flags which are not available in about:flags.
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -287,6 +292,8 @@ void ShowBadFlagsPrompt(content::WebContents* web_contents) {
+       return;
+     }
+   }
++
++  */
+ }
+ 
+ void ShowBadFlagsInfoBar(content::WebContents* web_contents,
+diff --git a/chrome/browser/ui/startup/infobar_utils.cc b/chrome/browser/ui/startup/infobar_utils.cc
+index 251135ab5a6f532a25278964112eb12824b0ef53..185b528e457a3818b0d1256a60681393695acc59 100644
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -79,8 +79,12 @@ bool ShouldShowBadFlagsSecurityWarnings() {
+ // This is a separate function to avoid accidentally reading the switch from
+ // `startup_command_line`.
+ bool IsAutomationEnabled() {
+-  return base::CommandLine::ForCurrentProcess()->HasSwitch(
+-      switches::kEnableAutomation);
++
++  //## SPOOF
++  return false;
++
++  //return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      //switches::kEnableAutomation);
+ }
+ 
+ // This is a separate function to avoid accidentally reading the switch from
+@@ -188,9 +192,14 @@ void AddInfoBarsIfNecessary(BrowserWindowInterface* browser,
+   infobars::ContentInfoBarManager* infobar_manager =
+       infobars::ContentInfoBarManager::FromWebContents(web_contents);
+ 
+-  if (!google_apis::HasAPIKeyConfigured()) {
+-    GoogleApiKeysInfoBarDelegate::Create(infobar_manager);
+-  }
++  //##SPOOF
++  // Suppress the visible "Google API keys are missing" startup infobar.
++  // This build intentionally runs without official Google API keys; surfacing
++  // the warning in runtime profiles creates user-visible noise.
++  //if (!google_apis::HasAPIKeyConfigured()) {
++    //GoogleApiKeysInfoBarDelegate::Create(infobar_manager);
++  //}
++  //---------------------------------------------------------------------------------
+ 
+   if (ObsoleteSystem::IsObsoleteNowOrSoon()) {
+     PrefService* local_state = g_browser_process->local_state();
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 857d7806537545ba98aec06bc87340f29c3f512d..78b035ea4ac892f6dec7fb917d1e768c856f3ef1 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "components/embedder_support/user_agent_utils.h"
+ 
++#include "base/json/json_reader.h"
++
+ #include <stdint.h>
+ 
+ #include <array>
+@@ -16,6 +18,7 @@
+ #include "base/compiler_specific.h"
+ #include "base/containers/contains.h"
+ #include "base/feature_list.h"
++#include "base/json/json_writer.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/strcat.h"
+@@ -24,6 +27,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/system/sys_info.h"
+ #include "base/version.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "build/util/chromium_git_revision.h"
+@@ -481,21 +485,21 @@ std::string GetProductAndVersion(
+                    version_info::GetProductNameAndVersionForUserAgent());
+ }
+ 
+-std::optional<std::string> GetUserAgentFromCommandLine() {
+-  base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+-  if (command_line->HasSwitch(kUserAgent)) {
+-    std::string ua = command_line->GetSwitchValueASCII(kUserAgent);
+-    if (net::HttpUtil::IsValidHeaderValue(ua)) {
++std::optional<std::string> GetUserAgentFromConfig() {
++  std::optional<std::string> ua =
++      base::weblim::GetFingerprintConfigString("userAgent");
++  if (ua.has_value() && !ua->empty()) {
++    if (net::HttpUtil::IsValidHeaderValue(*ua)) {
+       return ua;
+     }
+-    LOG(WARNING) << "Ignored invalid value for flag --" << kUserAgent;
++    LOG(WARNING) << "Ignored invalid userAgent value from fingerprint config.";
+   }
+   return std::nullopt;
+ }
+ 
+ std::string GetUserAgent(
+     UserAgentReductionEnterprisePolicyState user_agent_reduction) {
+-  std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
++  std::optional<std::string> custom_ua = GetUserAgentFromConfig();
+   if (custom_ua.has_value()) {
+     return custom_ua.value();
+   }
+@@ -677,18 +681,132 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   metadata.mobile = GetMobileBitForUAMetadata();
+   metadata.platform = GetPlatformForUAMetadata();
+ 
+-  // For users providing a valid user-agent override via the command line:
+-  // If kUACHOverrideBlank is enabled, set user-agent metadata with the
+-  // default blank values, otherwise return the default UserAgentMetadata values
+-  // to populate and send only the low entropy client hints.
+-  // Notes: Sending low entropy hints with empty values may cause requests being
+-  // blocked by web application firewall software, etc.
+-  std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
+-  if (custom_ua.has_value()) {
+-    return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
+-               ? blink::UserAgentMetadata()
+-               : metadata;
++  // =============================================================
++  // ##SPOOF LAYER 1##: Override UA-CH metadata via profile config.
++  // =============================================================
++  std::string json = base::weblim::GetFingerprintConfigJson("uach").value_or("");
++  if (!json.empty()) {
++
++    if (!json.empty()) {
++       auto parsed = base::JSONReader::Read(json, base::JSON_ALLOW_TRAILING_COMMAS);
++
++      if (parsed && parsed->is_dict()) {
++        const base::Value::Dict& dict = parsed->GetDict();
++        blink::UserAgentMetadata spoof = metadata;
++        bool has_full_version_list_override = false;
++        bool has_brand_version_list_override = false;
++
++       if (auto* list = dict.FindList("fullVersionList")) {
++          has_full_version_list_override = true;
++          spoof.brand_full_version_list.clear();
++          for (auto& v : *list) {
++            if (v.is_dict()) {
++              blink::UserAgentBrandVersion b;
++
++              if (const std::string* brand = v.GetDict().FindString("brand")) {
++                b.brand = *brand;
++              } else {
++                b.brand = "";
++              }
++
++              if (const std::string* version =
++                      v.GetDict().FindString("version")) {
++                b.version = *version;
++              } else {
++                b.version = "";
++              }
++
++              spoof.brand_full_version_list.push_back(std::move(b));
++            }
++          }
++        }
++
++        if (auto* fv = dict.FindString("fullVersion")) {
++          spoof.full_version = *fv;
++        }
++        if (auto* uafv = dict.FindString("uaFullVersion")) {
++          spoof.full_version = *uafv;
++        }
++
++        if (auto* arch = dict.FindString("architecture")) {
++          spoof.architecture = *arch;
++        }
++
++        if (auto* bit = dict.FindString("bitness")) {
++          spoof.bitness = *bit;
++        }
++
++        if (auto* m = dict.FindString("model")) {
++          spoof.model = *m;
++        }
++
++        if (auto* pfv = dict.FindString("platformVersion")) {
++          spoof.platform_version = *pfv;
++        }
++
++        if (auto wow_bool = dict.FindBool("wow64")) {
++          spoof.wow64 = *wow_bool;
++        } else if (auto* wow_string = dict.FindString("wow64")) {
++          spoof.wow64 = (*wow_string == "true");
++        }
++
++        // Low entropy values must also be preserved or spoofed.
++        if (auto* pf = dict.FindString("platform")) {
++          spoof.platform = *pf;
++        }
++
++        if (auto mobile_bool = dict.FindBool("mobile")) {
++          spoof.mobile = *mobile_bool;
++        } else if (auto* mobile_string = dict.FindString("mobile")) {
++          spoof.mobile = (*mobile_string == "true");
++        }
++
++       if (auto* brands = dict.FindList("brandVersionList")) {
++          has_brand_version_list_override = true;
++          spoof.brand_version_list.clear();
++          for (auto& v : *brands) {
++            if (v.is_dict()) {
++              blink::UserAgentBrandVersion b;
++
++              if (const std::string* brand = v.GetDict().FindString("brand")) {
++                b.brand = *brand;
++              } else {
++                b.brand = "";
++              }
++
++              if (const std::string* version =
++                      v.GetDict().FindString("version")) {
++                b.version = *version;
++              } else {
++                b.version = "";
++              }
++
++              spoof.brand_version_list.push_back(std::move(b));
++            }
++          }
++        }
++
++        if (!has_brand_version_list_override &&
++            has_full_version_list_override) {
++          spoof.brand_version_list.clear();
++          for (const auto& brand_version : spoof.brand_full_version_list) {
++            blink::UserAgentBrandVersion b;
++            b.brand = brand_version.brand;
++            const size_t dot = brand_version.version.find('.');
++            b.version = dot == std::string::npos
++                            ? brand_version.version
++                            : brand_version.version.substr(0, dot);
++            spoof.brand_version_list.push_back(std::move(b));
++          }
++        }
++
++        return spoof;
++      }
++    }
+   }
++  // =============================================================
++  // ##SPOOF LAYER 1 END##
++  // =============================================================
+ 
+   if (only_low_entropy_ch) {
+     return metadata;
+diff --git a/components/permissions/permission_context_base.cc b/components/permissions/permission_context_base.cc
+index 8ae484299b8edfa3c7456967424c45f12ba8df1b..5c0c534780e664b8e0c8e35ef383e6b145a2c798 100644
+--- a/components/permissions/permission_context_base.cc
++++ b/components/permissions/permission_context_base.cc
+@@ -12,6 +12,10 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "base/json/json_reader.h"
++#include "base/strings/string_util.h"
++#include "base/weblim/fingerprint_config.h"
++
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_forward.h"
+@@ -86,6 +90,77 @@ void LogPermissionBlockedMessage(content::RenderFrameHost* rfh,
+                     " permission has been blocked", reason}));
+ }
+ 
++const char* PermissionConfigKey(ContentSettingsType type) {
++  switch (type) {
++    case ContentSettingsType::GEOLOCATION:
++      return "geolocation";
++    case ContentSettingsType::NOTIFICATIONS:
++      return "notifications";
++    case ContentSettingsType::MEDIASTREAM_CAMERA:
++      return "camera";
++    case ContentSettingsType::MEDIASTREAM_MIC:
++      return "microphone";
++    case ContentSettingsType::SENSORS:
++      return "sensors";
++    case ContentSettingsType::BACKGROUND_SYNC:
++      return "backgroundSync";
++    default:
++      return nullptr;
++  }
++}
++
++std::optional<PermissionStatus> ParsePermissionStatusOverride(
++    const std::string& value) {
++  if (base::EqualsCaseInsensitiveASCII(value, "native")) {
++    return std::nullopt;
++  }
++  if (base::EqualsCaseInsensitiveASCII(value, "granted") ||
++      base::EqualsCaseInsensitiveASCII(value, "allow")) {
++    return PermissionStatus::GRANTED;
++  }
++  if (base::EqualsCaseInsensitiveASCII(value, "denied") ||
++      base::EqualsCaseInsensitiveASCII(value, "blocked") ||
++      base::EqualsCaseInsensitiveASCII(value, "block")) {
++    return PermissionStatus::DENIED;
++  }
++  if (base::EqualsCaseInsensitiveASCII(value, "prompt") ||
++      base::EqualsCaseInsensitiveASCII(value, "ask")) {
++    return PermissionStatus::ASK;
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> GetPermissionConfigValue(ContentSettingsType type) {
++  const char* key = PermissionConfigKey(type);
++  if (!key)
++    return std::nullopt;
++
++  std::optional<std::string> permissions_json =
++      base::weblim::GetFingerprintConfigJson("permissions");
++  if (!permissions_json || permissions_json->empty())
++    return std::nullopt;
++
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(*permissions_json, base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!parsed || !parsed->is_dict())
++    return std::nullopt;
++
++  const std::string* value = parsed->GetDict().FindString(key);
++  if (!value || value->empty())
++    return std::nullopt;
++
++  return *value;
++}
++
++std::optional<PermissionStatus> GetPermissionOverrideFromConfig(
++    ContentSettingsType type) {
++  std::optional<std::string> config_value = GetPermissionConfigValue(type);
++  if (config_value.has_value()) {
++    return ParsePermissionStatusOverride(*config_value);
++  }
++  return std::nullopt;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -321,10 +396,21 @@ content::PermissionResult PermissionContextBase::GetPermissionStatus(
+ }
+ 
+ content::PermissionResult PermissionContextBase::GetPermissionStatus(
+-    const PermissionResolver& resolver,
+-    content::RenderFrameHost* render_frame_host,
+-    const GURL& requesting_origin,
+-    const GURL& embedding_origin) const {
++  const PermissionResolver& resolver,
++  content::RenderFrameHost* render_frame_host,
++  const GURL& requesting_origin,
++  const GURL& embedding_origin) const {
++
++  // ##SPOOF## Profile-driven permission overrides.
++  std::optional<PermissionStatus> permission_override =
++      GetPermissionOverrideFromConfig(content_settings_type_);
++  if (permission_override.has_value()) {
++    return content::PermissionResult(
++        permission_override.value(),
++        content::PermissionStatusSource::UNSPECIFIED);
++  }
++  // ##SPOOF## END
++
+   // If the permission has been disabled through Finch, block all requests.
+   if (IsPermissionKillSwitchOn()) {
+     return content::PermissionResult(
+diff --git a/content/browser/client_hints/client_hints.cc b/content/browser/client_hints/client_hints.cc
+index 7dd544f2ac121d56f98129d1c3b8d0eaec9b9a06..3ea3d59f3d35d392fab8d0115ea2e18a8bf58197 100644
+--- a/content/browser/client_hints/client_hints.cc
++++ b/content/browser/client_hints/client_hints.cc
+@@ -10,6 +10,9 @@
+ 
+ #include "base/check_is_test.h"
+ #include "base/command_line.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/values.h"
+ #include "base/containers/contains.h"
+ #include "base/dcheck_is_on.h"
+ #include "base/feature_list.h"
+@@ -20,6 +23,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/time/time.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/build_config.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/preloading/prerender/prerender_host.h"
+@@ -711,6 +715,127 @@ void UpdateNavigationRequestClientUaHeadersImpl(
+     if (!ua_metadata.has_value())
+       ua_metadata = delegate->GetUserAgentMetadata();
+ 
++    // ##SPOOF##: Override UA Metadata from profile config JSON.
++    std::string json =
++        base::weblim::GetFingerprintConfigJson("uach").value_or("");
++    if (!json.empty()) {
++
++      if (!json.empty()) {
++        auto parsed = base::JSONReader::Read(json, base::JSON_ALLOW_TRAILING_COMMAS);
++        if (parsed && parsed->is_dict()) {
++          const base::Value::Dict& dict = parsed->GetDict();
++          blink::UserAgentMetadata override = ua_metadata.value();
++          bool has_full_version_list_override = false;
++          bool has_brand_version_list_override = false;
++
++          if (auto* fv = dict.FindString("fullVersion")) {
++            override.full_version = *fv;
++          }
++          if (auto* uafv = dict.FindString("uaFullVersion")) {
++            override.full_version = *uafv;
++          }
++
++          if (auto* pf = dict.FindString("platform")) {
++            override.platform = *pf;
++          }
++
++          if (auto* arch = dict.FindString("architecture")) {
++            override.architecture = *arch;
++          }
++
++          if (auto* bit = dict.FindString("bitness")) {
++            override.bitness = *bit;
++          }
++
++          if (auto* model = dict.FindString("model")) {
++            override.model = *model;
++          }
++
++          if (auto* platform_version = dict.FindString("platformVersion")) {
++            override.platform_version = *platform_version;
++          }
++
++          if (auto mobile_bool = dict.FindBool("mobile")) {
++            override.mobile = *mobile_bool;
++          } else if (auto* mobile_string = dict.FindString("mobile")) {
++            override.mobile = (*mobile_string == "true");
++          }
++
++          if (auto wow64_bool = dict.FindBool("wow64")) {
++            override.wow64 = *wow64_bool;
++          } else if (auto* wow64_string = dict.FindString("wow64")) {
++            override.wow64 = (*wow64_string == "true");
++          }
++
++          if (auto* list = dict.FindList("fullVersionList")) {
++            has_full_version_list_override = true;
++            override.brand_full_version_list.clear();
++            for (auto& v : *list) {
++              if (v.is_dict()) {
++                blink::UserAgentBrandVersion b;
++                if (const std::string* brand =
++                        v.GetDict().FindString("brand")) {
++                  b.brand = *brand;
++                } else {
++                  b.brand = "";
++                }
++
++                if (const std::string* version =
++                        v.GetDict().FindString("version")) {
++                  b.version = *version;
++                } else {
++                  b.version = "";
++                }
++                override.brand_full_version_list.push_back(std::move(b));
++              }
++            }
++          }
++
++          if (auto* brands = dict.FindList("brandVersionList")) {
++            has_brand_version_list_override = true;
++            override.brand_version_list.clear();
++            for (auto& v : *brands) {
++              if (v.is_dict()) {
++                blink::UserAgentBrandVersion b;
++                if (const std::string* brand =
++                        v.GetDict().FindString("brand")) {
++                  b.brand = *brand;
++                } else {
++                  b.brand = "";
++                }
++
++                if (const std::string* version =
++                        v.GetDict().FindString("version")) {
++                  b.version = *version;
++                } else {
++                  b.version = "";
++                }
++                override.brand_version_list.push_back(std::move(b));
++              }
++            }
++          }
++
++          if (!has_brand_version_list_override &&
++              has_full_version_list_override) {
++            override.brand_version_list.clear();
++            for (const auto& brand_version :
++                 override.brand_full_version_list) {
++              blink::UserAgentBrandVersion b;
++              b.brand = brand_version.brand;
++              const size_t dot = brand_version.version.find('.');
++              b.version = dot == std::string::npos
++                              ? brand_version.version
++                              : brand_version.version.substr(0, dot);
++              override.brand_version_list.push_back(std::move(b));
++            }
++          }
++
++          ua_metadata = override;
++        }
++      }
++    }
++    // ##SPOOF## END
++
+     // The `Sec-CH-UA` client hint is attached to all outgoing requests. This is
+     // (intentionally) different than other client hints.
+     // It's barred behind ShouldAddClientHints to make sure it's controlled by
+diff --git a/content/browser/devtools/devtools_instrumentation.cc b/content/browser/devtools/devtools_instrumentation.cc
+index 1130eab187af8aa30baa4ba5c692784b3f5b4a65..15daddbefe1f7ffa403a694fb9daf8eb8b371b2f 100644
+--- a/content/browser/devtools/devtools_instrumentation.cc
++++ b/content/browser/devtools/devtools_instrumentation.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ 
++#include "base/command_line.h"
++#include "base/json/json_reader.h"
++#include "base/values.h"
++
+ #include "base/containers/adapters.h"
+ #include "base/feature_list.h"
+ #include "base/notreached.h"
+diff --git a/content/browser/gpu/gpu_process_host.cc b/content/browser/gpu/gpu_process_host.cc
+index cd6b6be5cb1dc110229919154512e055d82a9e92..3c7ad222d79536b36dbe1b4aba4ee0505ba57f79 100644
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -1,3 +1,4 @@
++
+ // Copyright 2012 The Chromium Authors
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+diff --git a/services/device/time_zone_monitor/time_zone_monitor.cc b/services/device/time_zone_monitor/time_zone_monitor.cc
+index 5851ef75ab670ee3472765ba11f313ad850c58d0..0d67bb2ac9a6fbcbadd14f53ebe9b3e9af32255b 100644
+--- a/services/device/time_zone_monitor/time_zone_monitor.cc
++++ b/services/device/time_zone_monitor/time_zone_monitor.cc
+@@ -4,12 +4,18 @@
+ 
+ #include "services/device/time_zone_monitor/time_zone_monitor.h"
+ 
++#include "base/command_line.h"
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/values.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "third_party/icu/source/common/unicode/unistr.h"
+ #include "third_party/icu/source/i18n/unicode/timezone.h"
+ 
++#include <memory>
++#include <optional>
++
+ namespace device {
+ 
+ TimeZoneMonitor::TimeZoneMonitor()
+@@ -36,6 +42,13 @@ void TimeZoneMonitor::NotifyClients(std::string_view zone_id_str) {
+ 
+ void TimeZoneMonitor::UpdateIcuAndNotifyClients(
+     std::unique_ptr<icu::TimeZone> new_zone) {
++
++  //##SPOOF GUARD
++  if (base::weblim::GetFingerprintConfigString("timezone").has_value()) {
++    // Biz spoof modundayiz OS timezone degistiyse bile ICU ayarini BOZMA
++    return;
++  }
++
+   DCHECK(thread_checker_.CalledOnValidThread());
+   TRACE_EVENT0("device", "TimeZoneMonitor::UpdateIcuAndNotifyClients");
+ 
+diff --git a/third_party/blink/common/device_memory/approximated_device_memory.cc b/third_party/blink/common/device_memory/approximated_device_memory.cc
+index fee5a18fd0524bc2f3a55ceb51333bda05d4119c..9f1d82f67022443d76fab84176667bf692684289 100644
+--- a/third_party/blink/common/device_memory/approximated_device_memory.cc
++++ b/third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/public/common/device_memory/approximated_device_memory.h"
+ 
++#include "base/weblim/fingerprint_config.h"
++
+ #include "base/check_op.h"
+ #include "base/system/sys_info.h"
+ 
+@@ -23,7 +25,15 @@ void ApproximatedDeviceMemory::Initialize() {
+ }
+ 
+ // static
++//##SPOOF
+ float ApproximatedDeviceMemory::GetApproximatedDeviceMemory() {
++  if (std::optional<int> config_value =
++          base::weblim::GetFingerprintConfigInt("deviceMemory")) {
++    if (*config_value > 0) {
++      return static_cast<float>(*config_value);
++    }
++  }
++
+   return approximated_device_memory_gb_;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/events/navigator_events.cc b/third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c1197c98d93aaddd96a47674b7ad953..591c2496502f2b969aaca5b7a1bd7f1f3f483a40 100644
+--- a/third_party/blink/renderer/core/events/navigator_events.cc
++++ b/third_party/blink/renderer/core/events/navigator_events.cc
+@@ -30,6 +30,10 @@
+ 
+ #include "third_party/blink/renderer/core/events/navigator_events.h"
+ 
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/weblim/fingerprint_config.h"
++
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+@@ -38,6 +42,12 @@
+ namespace blink {
+ 
+ int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
++  if (std::optional<int> config_value =
++          base::weblim::GetFingerprintConfigInt("maxTouchPoints")) {
++    return *config_value;
++  }
++  // ##SPOOF END##
++
+   LocalDOMWindow* window = navigator.DomWindow();
+   return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
+ }
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index 0910e68f91b9090655f054976e34bffc1dbdc549..ecedef2dc73b923a6d314c722862d5972508a1ec 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -4,6 +4,11 @@
+ 
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+ 
++// ##SPOOF##
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/weblim/fingerprint_config.h"
++
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -54,6 +59,15 @@ String NavigatorBase::userAgent() const {
+ String NavigatorBase::platform() const {
+   ExecutionContext* execution_context = GetExecutionContext();
+ 
++  // ##SPOOF##: Keep Window and Worker navigator.platform aligned.
++  std::string fpPlatform =
++      base::weblim::GetFingerprintConfigString("navigatorPlatform")
++          .value_or("");
++  if (!fpPlatform.empty()) {
++    return String::FromUTF8(fpPlatform);
++  }
++  // ##SPOOF END##
++
+ #if BUILDFLAG(IS_ANDROID)
+   // For user-agent reduction phase 6, Android platform should be frozen
+   // string, see https://www.chromium.org/updates/ua-reduction/.
+@@ -97,6 +111,14 @@ void NavigatorBase::Trace(Visitor* visitor) const {
+ }
+ 
+ unsigned int NavigatorBase::hardwareConcurrency() const {
++  if (std::optional<int> config_value =
++          base::weblim::GetFingerprintConfigInt("hardwareConcurrency")) {
++    if (*config_value > 0) {
++      return static_cast<unsigned int>(*config_value);
++    }
++  }
++  // ##SPOOF## END
++
+   unsigned int hardware_concurrency =
+       NavigatorConcurrentHardware::hardwareConcurrency();
+ 
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index f8e3bb7712d31fd083082990e0bcb912097bd11f..ebd5291c7ee151eaa62ff7222c0c4afae5a32b9b 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -23,6 +23,9 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ 
++// ##SPOOF##
++#include "base/command_line.h"
++
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+@@ -68,6 +71,7 @@ String Navigator::platform() const {
+   // mobile and desktop when ReduceUserAgent is enabled.
+   if (!DomWindow())
+     return NavigatorBase::platform();
++
+   const String& platform_override =
+       DomWindow()->GetFrame()->GetSettings()->GetNavigatorPlatformOverride();
+   return platform_override.empty() ? NavigatorBase::platform()
+diff --git a/third_party/blink/renderer/core/frame/navigator_language.cc b/third_party/blink/renderer/core/frame/navigator_language.cc
+index 4907ba005a08a576abe1d9f6bd0c4077f178cc34..9ab80e184a037f9c640942980d0d896f9ddd7091 100644
+--- a/third_party/blink/renderer/core/frame/navigator_language.cc
++++ b/third_party/blink/renderer/core/frame/navigator_language.cc
+@@ -5,6 +5,9 @@
+ #include "third_party/blink/renderer/core/frame/navigator_language.h"
+ 
+ #include "base/command_line.h"
++#include "base/values.h"
++#include "base/values.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "services/network/public/cpp/features.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+@@ -12,6 +15,9 @@
+ #include "third_party/blink/renderer/platform/language.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
++#include <memory>
++#include <optional>
++
+ namespace blink {
+ 
+ Vector<String> ParseAndSanitize(const String& accept_languages) {
+@@ -70,6 +76,15 @@ void NavigatorLanguage::SetLanguagesForTesting(const String& languages) {
+ }
+ 
+ void NavigatorLanguage::EnsureUpdatedLanguage() {
++  // ##SPOOF## Locale override without using Chromium's global --lang switch.
++  std::string locale_override =
++      base::weblim::GetFingerprintConfigString("locale").value_or("");
++  if (!locale_override.empty()) {
++    languages_ = ParseAndSanitize(String::FromUTF8(locale_override));
++    languages_dirty_ = true;
++    return;
++  }
++
+   String accept_languages_override;
+   probe::ApplyAcceptLanguageOverride(execution_context_,
+                                      &accept_languages_override);
+diff --git a/third_party/blink/renderer/core/frame/navigator_ua.cc b/third_party/blink/renderer/core/frame/navigator_ua.cc
+index 6275dbfa196ca0211b89205289fa42d5cd348e3c..7263f3db841912bcfe938d9f27c1a420d07156d5 100644
+--- a/third_party/blink/renderer/core/frame/navigator_ua.cc
++++ b/third_party/blink/renderer/core/frame/navigator_ua.cc
+@@ -5,19 +5,100 @@
+ #include "third_party/blink/renderer/core/frame/navigator_ua.h"
+ 
+ #include "base/compiler_specific.h"
++#include "base/json/json_reader.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ #include "third_party/blink/renderer/core/frame/navigator_ua_data.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ 
+ namespace blink {
++namespace {
++
++std::optional<std::string> GetUachJsonOverride() {
++  std::optional<std::string> config_json =
++      base::weblim::GetFingerprintConfigJson("uach");
++  if (config_json && !config_json->empty())
++    return config_json;
++  return std::nullopt;
++}
++
++UserAgentBrandList ReadBrandList(const base::Value::Dict& dict,
++                                 std::string_view key) {
++  UserAgentBrandList brands;
++  const base::Value::List* list = dict.FindList(key);
++  if (!list)
++    return brands;
++
++  for (const auto& item : *list) {
++    if (!item.is_dict())
++      continue;
++
++    const base::Value::Dict& brand_dict = item.GetDict();
++    const std::string* brand = brand_dict.FindString("brand");
++    const std::string* version = brand_dict.FindString("version");
++    if (!brand || !version)
++      continue;
++
++    brands.emplace_back(*brand, *version);
++  }
++
++  return brands;
++}
++
++void ApplyUachJsonOverride(UserAgentMetadata& metadata) {
++  std::optional<std::string> json = GetUachJsonOverride();
++  if (!json)
++    return;
++
++  auto parsed = base::JSONReader::Read(*json, base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!parsed || !parsed->is_dict())
++    return;
++
++  const auto& dict = parsed->GetDict();
++  UserAgentBrandList brand_version_list =
++      ReadBrandList(dict, "brandVersionList");
++  if (!brand_version_list.empty())
++    metadata.brand_version_list = std::move(brand_version_list);
++
++  UserAgentBrandList brand_full_version_list =
++      ReadBrandList(dict, "fullVersionList");
++  if (!brand_full_version_list.empty())
++    metadata.brand_full_version_list = std::move(brand_full_version_list);
++
++  if (std::optional<bool> mobile_bool = dict.FindBool("mobile")) {
++    metadata.mobile = *mobile_bool;
++  } else if (const std::string* mobile_string = dict.FindString("mobile")) {
++    metadata.mobile = (*mobile_string == "true");
++  }
++
++  if (const std::string* platform = dict.FindString("platform"))
++    metadata.platform = *platform;
++  if (const std::string* platform_version = dict.FindString("platformVersion"))
++    metadata.platform_version = *platform_version;
++  if (const std::string* architecture = dict.FindString("architecture"))
++    metadata.architecture = *architecture;
++  if (const std::string* model = dict.FindString("model"))
++    metadata.model = *model;
++  if (const std::string* ua_full_version = dict.FindString("uaFullVersion"))
++    metadata.full_version = *ua_full_version;
++  if (const std::string* bitness = dict.FindString("bitness"))
++    metadata.bitness = *bitness;
++  if (std::optional<bool> wow64 = dict.FindBool("wow64"))
++    metadata.wow64 = *wow64;
++}
++
++}  // namespace
+ 
+ NavigatorUAData* NavigatorUA::userAgentData() {
+   NavigatorUAData* ua_data =
+       MakeGarbageCollected<NavigatorUAData>(GetUAExecutionContext());
+ 
+   UserAgentMetadata metadata = GetUserAgentMetadata();
++  ApplyUachJsonOverride(metadata);
+   ua_data->SetBrandVersionList(metadata.brand_version_list);
++
+   ua_data->SetMobile(metadata.mobile);
++
+   ua_data->SetPlatform(String::FromUTF8(metadata.platform),
+                        String::FromUTF8(metadata.platform_version));
+   ua_data->SetArchitecture(String::FromUTF8(metadata.architecture));
+diff --git a/third_party/blink/renderer/core/frame/navigator_ua_data.cc b/third_party/blink/renderer/core/frame/navigator_ua_data.cc
+index c1ed20c08e1d1bb14f3e9b062bcac9b55ec54868..c36a1547816262241ead893ee0f0088d01706829 100644
+--- a/third_party/blink/renderer/core/frame/navigator_ua_data.cc
++++ b/third_party/blink/renderer/core/frame/navigator_ua_data.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator_ua_data.h"
+ 
++#include "base/command_line.h"
++#include "base/json/json_reader.h"
++
+ #include "base/compiler_specific.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "third_party/blink/public/common/features.h"
+diff --git a/third_party/blink/renderer/core/geometry/dom_rect.cc b/third_party/blink/renderer/core/geometry/dom_rect.cc
+index 7bd7ac50d39c3e6c95e31def432c6f081b6f74c0..8d7de10d2fa583f922e11a2b26068491cf95b848 100644
+--- a/third_party/blink/renderer/core/geometry/dom_rect.cc
++++ b/third_party/blink/renderer/core/geometry/dom_rect.cc
+@@ -4,6 +4,11 @@
+ 
+ #include "third_party/blink/renderer/core/geometry/dom_rect.h"
+ 
++#include <optional>
++#include <string>
++
++#include "base/weblim/fingerprint_config.h"
++
+ #include "third_party/blink/renderer/bindings/core/v8/v8_dom_rect_init.h"
+ #include "third_party/blink/renderer/platform/wtf/math_extras.h"
+ #include "ui/gfx/geometry/rect.h"
+@@ -16,7 +21,39 @@ DOMRect* DOMRect::Create(double x, double y, double width, double height) {
+   return MakeGarbageCollected<DOMRect>(x, y, width, height);
+ }
+ 
+-DOMRect* DOMRect::FromRectF(const gfx::RectF& rect) {
++DOMRect* DOMRect::FromRectF(const gfx::RectF& rect_in) {
++  gfx::RectF rect = rect_in;
++
++  // === ##SPOOF CLIENTRECT JITTER — DETERMINISTIC ===
++  int seed = 0;
++
++  // 1) Seed tamamen flag'den gelir. Flag yoksa native davranış korunur.
++  {
++    std::optional<std::string> config_seed =
++        base::weblim::GetFingerprintConfigString("clientRectSeed");
++    std::string seed_str = config_seed ? *config_seed : "";
++
++    if (seed_str.empty()) {
++      return MakeGarbageCollected<DOMRect>(rect.x(), rect.y(), rect.width(),
++                                           rect.height());
++    }
++
++    for (unsigned char c : seed_str) {
++      seed = (seed * 131 + c) & 0x7fffffff;
++    }
++  }
++
++  auto noise = [&](int mod) {
++    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
++    return static_cast<float>(seed % mod) * 0.01f;  // deterministic jitter
++  };
++
++  rect.set_x(rect.x() + noise(50));
++  rect.set_y(rect.y() + noise(50));
++  rect.set_width(rect.width() + noise(25));
++  rect.set_height(rect.height() + noise(25));
++  // ======================================================
++
+   return MakeGarbageCollected<DOMRect>(rect.x(), rect.y(), rect.width(),
+                                        rect.height());
+ }
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index b362f94678bde4b7ae43f5f48e4734704729554d..15ec01a9e3b4ccc9d2b01d7a6b400949cadccf7e 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -31,6 +31,7 @@
+ 
+ #include <limits>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/feature_list.h"
+@@ -45,6 +46,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/build_config.h"
+ #include "cc/layers/texture_layer.h"
+ #include "services/metrics/public/cpp/ukm_recorder.h"
+@@ -400,8 +402,9 @@ void HTMLCanvasElement::Dispose() {
+   DiscardResources();
+ 
+   if (context_) {
+-    if (context_->Host())
++    if (context_->Host()) {
+       context_->DetachHost();
++    }
+     context_ = nullptr;
+   }
+ 
+@@ -510,8 +513,9 @@ bool HTMLCanvasElement::layoutSubtree() const {
+ }
+ 
+ void HTMLCanvasElement::SetSize(gfx::Size new_size) {
+-  if (new_size == Size())
++  if (new_size == Size()) {
+     return;
++  }
+   within_set_size_ = true;
+   SetIntegralAttribute(html_names::kWidthAttr, new_size.width());
+   SetIntegralAttribute(html_names::kHeightAttr, new_size.height());
+@@ -556,8 +560,9 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContext(
+   auto* result =
+       GetCanvasRenderingContextInternal(execution_context, type, attributes);
+ 
+-  if (ContentsCcLayer() != old_contents_cc_layer)
++  if (ContentsCcLayer() != old_contents_cc_layer) {
+     SetNeedsCompositingUpdate();
++  }
+ 
+   return result;
+ }
+@@ -580,15 +585,17 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
+ 
+   CanvasRenderingContextFactory* factory =
+       GetRenderingContextFactory(static_cast<int>(rendering_api));
+-  if (!factory)
++  if (!factory) {
+     return nullptr;
++  }
+ 
+   // FIXME - The code depends on the context not going away once created, to
+   // prevent JS from seeing a dangling pointer. So for now we will disallow the
+   // context from being changed once it is created.
+   if (context_) {
+-    if (context_->GetRenderingAPI() == rendering_api)
++    if (context_->GetRenderingAPI() == rendering_api) {
+       return context_.Get();
++    }
+ 
+     factory->OnError(this,
+                      "Canvas has an existing context of a different type");
+@@ -608,8 +615,9 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
+   }
+ 
+   context_ = factory->Create(execution_context, this, recomputed_attributes);
+-  if (!context_)
++  if (!context_) {
+     return nullptr;
++  }
+ 
+   context_->RecordUKMCanvasRenderingAPI();
+   context_->RecordUMACanvasRenderingAPI();
+@@ -621,8 +629,9 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
+ 
+   context_creation_was_blocked_ = false;
+ 
+-  if (IsWebGL())
++  if (IsWebGL()) {
+     UpdateMemoryUsage();
++  }
+ 
+   LayoutObject* layout_object = GetLayoutObject();
+   if (layout_object) {
+@@ -634,8 +643,9 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
+   }
+ 
+   if (context_->CreationAttributes().desynchronized) {
+-    if (!CreateLayer())
++    if (!CreateLayer()) {
+       return nullptr;
++    }
+     SetNeedsUnbufferedInputEvents(true);
+     GetOrCreateResourceDispatcher();
+     UseCounter::Count(GetDocument(), WebFeature::kHTMLCanvasElementLowLatency);
+@@ -643,8 +653,9 @@ CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
+ 
+   // A 2D context does not know before lazy creation whether or not it is
+   // direct composited.
+-  if (!IsRenderingContext2D())
++  if (!IsRenderingContext2D()) {
+     SetNeedsCompositingUpdate();
++  }
+ 
+   is_opaque_ = SkAlphaTypeIsOpaque(GetRenderingContextAlphaType());
+   if (cc_layer_) {
+@@ -679,8 +690,9 @@ bool HTMLCanvasElement::ShouldBeDirectComposited() const {
+ 
+ Settings* HTMLCanvasElement::GetSettings() const {
+   auto* window = DynamicTo<LocalDOMWindow>(GetExecutionContext());
+-  if (window && window->GetFrame())
++  if (window && window->GetFrame()) {
+     return window->GetFrame()->GetSettings();
++  }
+   return nullptr;
+ }
+ 
+@@ -771,8 +783,9 @@ void HTMLCanvasElement::PostFinalizeFrame(FlushReason reason) {
+   // the canvas's image. (e.g. WebGL context with preserveDrawingBuffer=false).
+   // If the canvas is not visible, DoDeferredPaintInvalidation will not get
+   // called, so we need to take care of business here.
+-  if (!did_notify_listeners_for_current_frame_)
++  if (!did_notify_listeners_for_current_frame_) {
+     NotifyListenersCanvasChanged();
++  }
+   did_notify_listeners_for_current_frame_ = false;
+ 
+   NotifyCachesOfSwitchingFrame();
+@@ -798,10 +811,11 @@ void HTMLCanvasElement::DoDeferredPaintInvalidation() {
+ 
+   gfx::RectF content_rect;
+   if (layout_box) {
+-    if (auto* replaced = DynamicTo<LayoutReplaced>(layout_box))
++    if (auto* replaced = DynamicTo<LayoutReplaced>(layout_box)) {
+       content_rect = gfx::RectF(replaced->ReplacedContentRect());
+-    else
++    } else {
+       content_rect = gfx::RectF(layout_box->PhysicalContentBoxRect());
++    }
+   }
+ 
+   if (IsRenderingContext2D()) {
+@@ -822,8 +836,9 @@ void HTMLCanvasElement::DoDeferredPaintInvalidation() {
+       invalidation_rect = gfx::RectF(dirty_rect_);
+     }
+ 
+-    if (dirty_rect_.IsEmpty())
++    if (dirty_rect_.IsEmpty()) {
+       return;
++    }
+ 
+     if (cc_layer_ && context_->IsComposited()) {
+       cc_layer_->SetNeedsDisplayRect(gfx::ToEnclosingRect(invalidation_rect));
+@@ -900,8 +915,9 @@ void HTMLCanvasElement::OnWidthOrHeightAssigned() {
+ 
+   if (LayoutObject* layout_object = GetLayoutObject()) {
+     if (layout_object->IsCanvas()) {
+-      if (old_size != Size())
++      if (old_size != Size()) {
+         To<LayoutHTMLCanvas>(layout_object)->CanvasSizeChanged();
++      }
+       layout_object->SetShouldDoFullPaintInvalidation();
+     }
+   }
+@@ -923,18 +939,21 @@ bool HTMLCanvasElement::PaintsIntoCanvasBuffer() const {
+     return false;
+   }
+   DCHECK(context_);
+-  if (!context_->IsComposited())
++  if (!context_->IsComposited()) {
+     return true;
++  }
+   auto* settings = GetDocument().GetSettings();
+-  if (settings && settings->GetAcceleratedCompositingEnabled())
++  if (settings && settings->GetAcceleratedCompositingEnabled()) {
+     return false;
++  }
+ 
+   return true;
+ }
+ 
+ void HTMLCanvasElement::NotifyListenersCanvasChanged() {
+-  if (listeners_.size() == 0)
++  if (listeners_.size() == 0) {
+     return;
++  }
+ 
+   if (!OriginClean()) {
+     listeners_.clear();
+@@ -943,12 +962,14 @@ void HTMLCanvasElement::NotifyListenersCanvasChanged() {
+ 
+   bool listener_needs_new_frame_capture = false;
+   for (const CanvasDrawListener* listener : listeners_) {
+-    if (listener->NeedsNewFrame())
++    if (listener->NeedsNewFrame()) {
+       listener_needs_new_frame_capture = true;
++    }
+   }
+ 
+-  if (!listener_needs_new_frame_capture)
++  if (!listener_needs_new_frame_capture) {
+     return;
++  }
+ 
+   scoped_refptr<StaticBitmapImage> source_image;
+   if (!copier_) {
+@@ -961,8 +982,9 @@ void HTMLCanvasElement::NotifyListenersCanvasChanged() {
+       context_ && SkAlphaTypeIsOpaque(context_->GetAlphaType());
+ 
+   for (CanvasDrawListener* listener : listeners_) {
+-    if (!listener->NeedsNewFrame())
++    if (!listener->NeedsNewFrame()) {
+       continue;
++    }
+ 
+     // Split the listener's callback so that it can be used with both the one
+     // copy path and fallback two copy path below.
+@@ -994,8 +1016,9 @@ void HTMLCanvasElement::NotifyListenersCanvasChanged() {
+     if (!source_image) {
+       SourceImageStatus status;
+       source_image = GetSourceImageForCanvasInternal(&status);
+-      if (status != kNormalSourceImageStatus)
++      if (status != kNormalSourceImageStatus) {
+         continue;
++      }
+     }
+ 
+     // Here we need to use the SharedGpuContext as some of the images may
+@@ -1078,8 +1101,9 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+     DCHECK(GetDocument().IsPrintingOrPaintingPreview());
+     scoped_refptr<StaticBitmapImage> image_for_printing =
+         OffscreenCanvasFrame()->Bitmap()->MakeUnaccelerated();
+-    if (!image_for_printing)
++    if (!image_for_printing) {
+       return;
++    }
+     context.DrawImage(*image_for_printing, Image::kSyncDecode,
+                       ImageAutoDarkMode::Disabled(), ImagePaintTimingInfo(),
+                       gfx::RectF(ToPixelSnappedRect(r)));
+@@ -1206,8 +1230,9 @@ String HTMLCanvasElement::ToDataURLInternal(
+     const double& quality,
+     SourceDrawingBuffer source_buffer) const {
+   base::TimeTicks start_time = base::TimeTicks::Now();
+-  if (!IsPaintable())
++  if (!IsPaintable()) {
+     return String("data:,");
++  }
+ 
+   ImageEncodingMimeType encoding_mime_type =
+       ImageEncoderUtils::ToEncodingMimeType(
+@@ -1215,10 +1240,61 @@ String HTMLCanvasElement::ToDataURLInternal(
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
++    // ##SPOOF: Canvas Jitter using profile config.
++    {
++      std::optional<int> config_seed =
++          base::weblim::GetFingerprintConfigInt("canvasSeed");
++      int seed = config_seed.value_or(0);
++
++      if (seed != 0) {
++        unsigned int noise = (seed * 31) & 0xFF;
++
++        gfx::Size size = image_bitmap->Size();
++
++        if (size.width() > 0 && size.height() > 0) {
++          SkImageInfo info =
++              SkImageInfo::MakeN32Premul(size.width(), size.height());
++
++          size_t rowBytes = info.minRowBytes();
++          size_t totalBytes = rowBytes * size.height();
++
++          std::vector<uint8_t> buffer(totalBytes);
++          SkPixmap pixmap(info, buffer.data(), rowBytes);
++
++          bool ok = image_bitmap->PaintImageForCurrentFrame().readPixels(
++              pixmap.info(), pixmap.writable_addr(), pixmap.rowBytes(), 0, 0);
++
++          if (ok) {
++            // RGB jitter
++            for (int y = 0; y < size.height(); ++y) {
++              uint8_t* row = buffer.data() + y * rowBytes;
++              for (int x = 0; x < size.width(); ++x) {
++                uint8_t* px = row + x * 4;
++                px[0] = (px[0] + noise) & 255;
++                px[1] = (px[1] + noise) & 255;
++                px[2] = (px[2] + noise) & 255;
++              }
++            }
++
++            // RGB jitter bittiginde buffer'in içinde gürültülü piksel verisi
++            // var.
++            // Bunu SkData'ya kopyalayip StaticBitmapImage'e ceviriyoruz.
++            sk_sp<SkData> data =
++                SkData::MakeWithCopy(buffer.data(), totalBytes);
++            if (data) {
++              image_bitmap = StaticBitmapImage::Create(std::move(data), info);
++            }
++          }
++        }
++      }
++    }
++    //===================
++
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+-    if (!data_buffer)
++    if (!data_buffer) {
+       return String("data:,");
++    }
+ 
+     String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
+     base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
+@@ -1255,6 +1331,22 @@ String HTMLCanvasElement::ToDataURLInternal(
+     TRACE_EVENT_INSTANT(
+         TRACE_DISABLED_BY_DEFAULT("identifiability.high_entropy_api"),
+         "CanvasReadback", "data_url", data_url.Utf8());
++
++   // --- WEBGL ONLY JITTER (NON-DESTRUCTIVE, SAFE) ---
++    {
++      const CanvasRenderingContext* ctx = RenderingContext();
++      if (ctx && ctx->IsWebGL()) {  // <--- WEBGL tespiti BURADA
++
++        std::optional<int> config_seed =
++            base::weblim::GetFingerprintConfigInt("webglSeed");
++
++        if (config_seed.has_value()) {
++          data_url = data_url + "#w" + String::Number(config_seed.value());
++        }
++      }
++    }
++    // ---------------------------------------------------
++
+     return data_url;
+   }
+ 
+@@ -1279,8 +1371,9 @@ String HTMLCanvasElement::toDataURL(const String& mime_type,
+   double quality = kUndefinedQualityValue;
+   if (!quality_argument.IsEmpty()) {
+     v8::Local<v8::Value> v8_value = quality_argument.V8Value();
+-    if (v8_value->IsNumber())
++    if (v8_value->IsNumber()) {
+       quality = v8_value.As<v8::Number>()->Value();
++    }
+   }
+   return ToDataURLInternal(mime_type, quality, kBackBuffer);
+ }
+@@ -1294,8 +1387,9 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+     return;
+   }
+ 
+-  if (!GetExecutionContext())
++  if (!GetExecutionContext()) {
+     return;
++  }
+ 
+   if (ContextHasOpenLayers(context_)) {
+     exception_state.ThrowDOMException(
+@@ -1318,8 +1412,9 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+   double quality = kUndefinedQualityValue;
+   if (!quality_argument.IsEmpty()) {
+     v8::Local<v8::Value> v8_value = quality_argument.V8Value();
+-    if (v8_value->IsNumber())
++    if (v8_value->IsNumber()) {
+       quality = v8_value.As<v8::Number>()->Value();
++    }
+   }
+ 
+   ImageEncodingMimeType encoding_mime_type =
+@@ -1350,8 +1445,9 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+ 
+ bool HTMLCanvasElement::IsPresentationAttribute(
+     const QualifiedName& name) const {
+-  if (name == html_names::kWidthAttr || name == html_names::kHeightAttr)
++  if (name == html_names::kWidthAttr || name == html_names::kHeightAttr) {
+     return true;
++  }
+   return HTMLElement::IsPresentationAttribute(name);
+ }
+ 
+@@ -1361,12 +1457,14 @@ void HTMLCanvasElement::CollectStyleForPresentationAttribute(
+     HeapVector<CSSPropertyValue, 8>& style) {
+   if (name == html_names::kWidthAttr) {
+     const AtomicString& height = FastGetAttribute(html_names::kHeightAttr);
+-    if (!height.IsNull())
++    if (!height.IsNull()) {
+       ApplyIntegerAspectRatioToStyle(value, height, style);
++    }
+   } else if (name == html_names::kHeightAttr) {
+     const AtomicString& width = FastGetAttribute(html_names::kWidthAttr);
+-    if (!width.IsNull())
++    if (!width.IsNull()) {
+       ApplyIntegerAspectRatioToStyle(width, value, style);
++    }
+   } else {
+     HTMLElement::CollectStyleForPresentationAttribute(name, value, style);
+   }
+@@ -1428,12 +1526,14 @@ bool HTMLCanvasElement::PushFrame(scoped_refptr<CanvasResource>&& image,
+ }
+ 
+ bool HTMLCanvasElement::ShouldAccelerate() const {
+-  if (context_ && !IsRenderingContext2D())
++  if (context_ && !IsRenderingContext2D()) {
+     return false;
++  }
+ 
+   // The command line flag --disable-accelerated-2d-canvas toggles this option
+-  if (!RuntimeEnabledFeatures::Accelerated2dCanvasEnabled())
++  if (!RuntimeEnabledFeatures::Accelerated2dCanvasEnabled()) {
+     return false;
++  }
+ 
+   // Webview crashes with accelerated small canvases (crbug.com/1004304)
+   // Experimenting to see if this still causes crashes (crbug.com/1136603)
+@@ -1442,20 +1542,23 @@ bool HTMLCanvasElement::ShouldAccelerate() const {
+           features::kWebviewAccelerateSmallCanvases)) {
+     base::CheckedNumeric<int> checked_canvas_pixel_count =
+         Size().GetCheckedArea();
+-    if (!checked_canvas_pixel_count.IsValid())
++    if (!checked_canvas_pixel_count.IsValid()) {
+       return false;
++    }
+     int canvas_pixel_count = checked_canvas_pixel_count.ValueOrDie();
+ 
+-    if (canvas_pixel_count < kMinimumAccelerated2dCanvasSize)
++    if (canvas_pixel_count < kMinimumAccelerated2dCanvasSize) {
+       return false;
++    }
+   }
+ 
+   // The following is necessary for handling the special case of canvases in
+   // the dev tools overlay, which run in a process that supports accelerated
+   // 2d canvas but in a special compositing context that does not.
+   auto* settings = GetDocument().GetSettings();
+-  if (settings && !settings->GetAcceleratedCompositingEnabled())
++  if (settings && !settings->GetAcceleratedCompositingEnabled()) {
+     return false;
++  }
+ 
+   if (context_ &&
+       context_->CreationAttributes().will_read_frequently ==
+@@ -1613,8 +1716,9 @@ void HTMLCanvasElement::PageVisibilityChanged() {
+ }
+ 
+ void HTMLCanvasElement::ContextDestroyed() {
+-  if (context_)
++  if (context_) {
+     context_->Stop();
++  }
+ }
+ 
+ bool HTMLCanvasElement::StyleChangeNeedsDidDraw(
+@@ -1653,8 +1757,9 @@ void HTMLCanvasElement::StyleDidChange(const ComputedStyle* old_style,
+   if (context_) {
+     context_->StyleDidChange(old_style, new_style);
+   }
+-  if (StyleChangeNeedsDidDraw(old_style, new_style))
++  if (StyleChangeNeedsDidDraw(old_style, new_style)) {
+     DidDraw();
++  }
+ }
+ 
+ void HTMLCanvasElement::LayoutObjectDestroyed() {
+@@ -1891,10 +1996,12 @@ scoped_refptr<StaticBitmapImage> HTMLCanvasElement::GetTransparentImage() {
+ }
+ 
+ cc::Layer* HTMLCanvasElement::ContentsCcLayer() const {
+-  if (surface_layer_bridge_)
++  if (surface_layer_bridge_) {
+     return surface_layer_bridge_->GetCcLayer();
+-  if (context_ && context_->IsComposited())
++  }
++  if (context_ && context_->IsComposited()) {
+     return context_->CcLayer();
++  }
+   return nullptr;
+ }
+ 
+diff --git a/third_party/blink/renderer/core/timing/performance.cc b/third_party/blink/renderer/core/timing/performance.cc
+index 2af0cc841ae9e1a723a67d1f12e1a75beb29f260..9457ecceb04265ef248e79b198c1290807a33644 100644
+--- a/third_party/blink/renderer/core/timing/performance.cc
++++ b/third_party/blink/renderer/core/timing/performance.cc
+@@ -32,16 +32,21 @@
+ #include "third_party/blink/renderer/core/timing/performance.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstdint>
+ #include <optional>
++#include <string>
+ 
+ #include "base/check_op.h"
+ #include "base/containers/contains.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/default_clock.h"
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/mojom/permissions_policy/document_policy_feature.mojom-blink.h"
+@@ -128,6 +133,80 @@ bool IsMeasureOptionsEmpty(const PerformanceMeasureOptions& options) {
+          !options.hasDuration();
+ }
+ 
++std::optional<double> GetWebilimTimingDouble(std::string_view config_key) {
++  std::optional<double> config_value =
++      base::weblim::GetFingerprintConfigDouble(config_key);
++  if (config_value && std::isfinite(*config_value))
++    return config_value;
++  return std::nullopt;
++}
++
++std::string GetWebilimProfileSeed() {
++  std::optional<std::string> config_value =
++      base::weblim::GetFingerprintConfigString("profileSeed");
++  if (config_value && !config_value->empty())
++    return *config_value;
++
++  return "weblim";
++}
++
++uint32_t HashWebilimTimingSeed(const std::string& seed) {
++  uint32_t hash = 2166136261u;
++  for (unsigned char c : seed) {
++    hash ^= c;
++    hash *= 16777619u;
++  }
++  return hash;
++}
++
++double GetWebilimTimingOffset(double noise_max_ms,
++                              std::optional<double> precision_ms) {
++  if (noise_max_ms <= 0)
++    return 0;
++
++  double max_offset = noise_max_ms;
++  if (precision_ms && *precision_ms > 0)
++    max_offset = std::min(max_offset, *precision_ms * 0.49);
++
++  if (max_offset <= 0)
++    return 0;
++
++  uint32_t hash = HashWebilimTimingSeed(GetWebilimProfileSeed());
++  double unit = static_cast<double>(hash % 1000000u) / 999999.0;
++  return unit * max_offset;
++}
++
++DOMHighResTimeStamp ApplyWebilimTimingPrecision(DOMHighResTimeStamp value) {
++  std::optional<double> precision_ms =
++      GetWebilimTimingDouble("timePrecisionMs");
++
++  bool enabled = precision_ms && *precision_ms > 0;
++  if (!enabled)
++    return value;
++
++  DOMHighResTimeStamp adjusted = value;
++  if (precision_ms && *precision_ms > 0)
++    adjusted = std::floor(adjusted / *precision_ms) * *precision_ms;
++
++  return std::max<DOMHighResTimeStamp>(0, adjusted);
++}
++
++DOMHighResTimeStamp ApplyWebilimTimingNoise(DOMHighResTimeStamp value) {
++  std::optional<double> precision_ms =
++      GetWebilimTimingDouble("timePrecisionMs");
++  std::optional<double> noise_max_ms =
++      GetWebilimTimingDouble("timingNoiseMaxMs");
++
++  if (!noise_max_ms || *noise_max_ms <= 0)
++    return value;
++
++  DOMHighResTimeStamp adjusted = value;
++  if (noise_max_ms && *noise_max_ms > 0)
++    adjusted += GetWebilimTimingOffset(*noise_max_ms, precision_ms);
++
++  return std::max<DOMHighResTimeStamp>(0, adjusted);
++}
++
+ base::TimeDelta GetUnixAtZeroMonotonic(const base::Clock* clock,
+                                        const base::TickClock* tick_clock) {
+   base::TimeDelta unix_time_now = clock->Now() - base::Time::UnixEpoch();
+@@ -1239,8 +1318,9 @@ DOMHighResTimeStamp Performance::ClampTimeResolution(
+     base::TimeDelta time,
+     bool cross_origin_isolated_capability) {
+   static TimeClamper clamper;
+-  return clamper.ClampTimeResolution(time, cross_origin_isolated_capability)
+-      .InMillisecondsF();
++  return ApplyWebilimTimingPrecision(
++      clamper.ClampTimeResolution(time, cross_origin_isolated_capability)
++          .InMillisecondsF());
+ }
+ 
+ // static
+@@ -1260,7 +1340,7 @@ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
+                           cross_origin_isolated_capability);
+   if (clamped_time < 0 && !allow_negative_value)
+     return 0.0;
+-  return clamped_time;
++  return ApplyWebilimTimingNoise(clamped_time);
+ }
+ 
+ DOMHighResTimeStamp Performance::MonotonicTimeToDOMHighResTimeStamp(
+diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_ice_candidate.cc b/third_party/blink/renderer/modules/peerconnection/rtc_ice_candidate.cc
+index 2c4713a9717a57a7599598e1c6fe6db1c2d3e90b..d9047d62cb6639b00f8e8e708981038ad27c44ee 100644
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_ice_candidate.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_ice_candidate.cc
+@@ -30,8 +30,13 @@
+ 
+ #include "third_party/blink/renderer/modules/peerconnection/rtc_ice_candidate.h"
+ 
++#include <string>
+ #include <utility>
+ 
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/weblim/fingerprint_config.h"
++
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_rtc_ice_candidate_init.h"
+@@ -48,6 +53,23 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ 
+ namespace blink {
++namespace {
++
++bool ShouldMaskWebRtcIpCandidates() {
++  std::string web_rtc_policy =
++      base::weblim::GetFingerprintConfigString("webRtcPolicy").value_or("");
++  return base::EqualsCaseInsensitiveASCII(web_rtc_policy,
++                                          "MaskHostCandidates");
++}
++
++bool IsMaskedIpCandidate(const String& candidate) {
++  std::string raw = candidate.Utf8();
++  return raw.find(" typ host") != std::string::npos ||
++         raw.find(" typ srflx") != std::string::npos ||
++         raw.find(" typ prflx") != std::string::npos;
++}
++
++}  // namespace
+ 
+ RTCIceCandidate* RTCIceCandidate::Create(
+     ExecutionContext* context,
+@@ -83,6 +105,12 @@ RTCIceCandidate::RTCIceCandidate(RTCIceCandidatePlatform* platform_candidate)
+     : platform_candidate_(platform_candidate) {}
+ 
+ String RTCIceCandidate::candidate() const {
++  // ##SPOOF## Prevent WebRTC IP leaks through host/reflexive candidates.
++  if (ShouldMaskWebRtcIpCandidates() &&
++      IsMaskedIpCandidate(platform_candidate_->Candidate()))
++    return String();
++  // ##SPOOF END##
++
+   return platform_candidate_->Candidate();
+ }
+ 
+@@ -116,6 +144,10 @@ std::optional<uint32_t> RTCIceCandidate::priority() const {
+ }
+ 
+ String RTCIceCandidate::address() const {
++  if (ShouldMaskWebRtcIpCandidates() &&
++      IsMaskedIpCandidate(platform_candidate_->Candidate()))
++    return String();
++
+   return platform_candidate_->Address();
+ }
+ 
+@@ -140,6 +172,10 @@ std::optional<V8RTCIceTcpCandidateType> RTCIceCandidate::tcpType() const {
+ }
+ 
+ String RTCIceCandidate::relatedAddress() const {
++  if (ShouldMaskWebRtcIpCandidates() &&
++      IsMaskedIpCandidate(platform_candidate_->Candidate()))
++    return String();
++
+   return platform_candidate_->RelatedAddress();
+ }
+ 
+@@ -166,7 +202,7 @@ std::optional<V8RTCIceServerTransportProtocol> RTCIceCandidate::relayProtocol()
+ 
+ ScriptObject RTCIceCandidate::toJSONForBinding(ScriptState* script_state) {
+   V8ObjectBuilder result(script_state);
+-  result.AddString("candidate", platform_candidate_->Candidate());
++  result.AddString("candidate", candidate());
+   result.AddString("sdpMid", platform_candidate_->SdpMid());
+   if (platform_candidate_->SdpMLineIndex())
+     result.AddNumber("sdpMLineIndex", *platform_candidate_->SdpMLineIndex());
+diff --git a/third_party/blink/renderer/modules/peerconnection/rtc_session_description.cc b/third_party/blink/renderer/modules/peerconnection/rtc_session_description.cc
+index 1b06d623144c3bc6cc85eaa6a6b18ddd2bd55b91..26a8e1f39e98f190aff5fcb4b9b21e8009bc4157 100644
+--- a/third_party/blink/renderer/modules/peerconnection/rtc_session_description.cc
++++ b/third_party/blink/renderer/modules/peerconnection/rtc_session_description.cc
+@@ -7,10 +7,10 @@
+  *
+  * 1. Redistributions of source code must retain the above copyright
+  *    notice, this list of conditions and the following disclaimer.
+- * 2. Redistributions in binary form must reproduce the above copyright
+- *    notice, this list of conditions and the following disclaimer
+- *    in the documentation and/or other materials provided with the
+- *    distribution.
++ * 2. Redistributions in binary form must reproduce the above
++ *    copyright notice, this list of conditions and the following
++ *    disclaimer in the documentation and/or other materials provided
++ *    with the distribution.
+  * 3. Neither the name of Google Inc. nor the names of its contributors
+  *    may be used to endorse or promote products derived from this
+  *    software without specific prior written permission.
+@@ -30,6 +30,12 @@
+ 
+ #include "third_party/blink/renderer/modules/peerconnection/rtc_session_description.h"
+ 
++#include <string>
++#include <vector>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_rtc_session_description_init.h"
+@@ -38,6 +44,45 @@
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ 
+ namespace blink {
++namespace {
++
++bool ShouldMaskWebRtcIpCandidates() {
++  std::string web_rtc_policy =
++      base::weblim::GetFingerprintConfigString("webRtcPolicy").value_or("");
++  return base::EqualsCaseInsensitiveASCII(web_rtc_policy,
++                                          "MaskHostCandidates");
++}
++
++bool IsMaskedIpCandidateLine(const std::string& line) {
++  return line.find(" typ host") != std::string::npos ||
++         line.find(" typ srflx") != std::string::npos ||
++         line.find(" typ prflx") != std::string::npos;
++}
++
++String MaskSdpCandidates(const String& sdp) {
++  if (!ShouldMaskWebRtcIpCandidates())
++    return sdp;
++
++  std::string raw = sdp.Utf8();
++  std::vector<std::string> lines = base::SplitString(
++      raw, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++  std::vector<std::string> filtered_lines;
++  filtered_lines.reserve(lines.size());
++  for (std::string& line : lines) {
++    bool had_cr = !line.empty() && line.back() == '\r';
++    std::string comparable = had_cr ? line.substr(0, line.size() - 1) : line;
++    if (base::StartsWith(comparable, "a=candidate:",
++                         base::CompareCase::SENSITIVE) &&
++        IsMaskedIpCandidateLine(comparable))
++      continue;
++
++    filtered_lines.push_back(line);
++  }
++
++  return String::FromUTF8(base::JoinString(filtered_lines, "\n"));
++}
++
++}  // namespace
+ 
+ RTCSessionDescription* RTCSessionDescription::Create(
+     ExecutionContext* context,
+@@ -79,7 +124,7 @@ void RTCSessionDescription::setType(std::optional<V8RTCSdpType> type) {
+ }
+ 
+ String RTCSessionDescription::sdp() const {
+-  return platform_session_description_->Sdp();
++  return MaskSdpCandidates(platform_session_description_->Sdp());
+ }
+ 
+ void RTCSessionDescription::setSdp(const String& sdp) {
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+index 2ee00d2382c374bd0325f635e7c271adcf1be29c..eb973149f514fecf2244bf5b5d4accb2cb9d2290 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+@@ -4,10 +4,13 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
+ 
++// ##SPOOF##
+ #include <algorithm>
++#include <optional>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/trace_event/typed_macros.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "media/base/audio_bus.h"
+ #include "media/base/audio_glitch_info.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -306,6 +309,53 @@ bool OfflineAudioDestinationHandler::RenderIfNotSuspended(
+   if (!rendered_bus) {
+     destination_bus->Zero();
+   } else if (rendered_bus != destination_bus) {
++    // ##SPOOF##
++    // ====== FP AUDIOCONTEXT JITTER (NATIVE) ======
++    {
++      std::optional<int> config_seed =
++          base::weblim::GetFingerprintConfigInt("audioSeed");
++      int audio_seed = config_seed.value_or(0);
++
++      if (audio_seed != 0 && rendered_bus) {
++        bool microMode = false;
++
++        int channels = rendered_bus->NumberOfChannels();
++        unsigned frames = rendered_bus->length();
++
++        if (microMode) {
++          // ===== MIKRO MODE (CHROME-CLUSTER SAFE) =====
++          uint32_t seed = static_cast<uint32_t>(audio_seed);
++
++          for (int ch = 0; ch < channels; ++ch) {
++            float* buf = rendered_bus->Channel(ch)->MutableData();
++
++            for (unsigned i = 0; i < frames; ++i) {
++              // deterministic LCG
++              seed = seed * 1664525u + 1013904223u;
++
++              // tiny jitter in [-1e-9, 1e-9]
++              float jitter = ((seed & 0xFF) - 128) * 1e-9f;
++              buf[i] += jitter;
++            }
++          }
++
++        } else {
++          // ===== LEGACY MODE (GLOBAL OFFSET NOISE) =====
++          int seed = audio_seed;
++          float noise = (seed % 17) * 1e-7f;  // deterministic global noise
++
++          for (int ch = 0; ch < channels; ++ch) {
++            float* buf = rendered_bus->Channel(ch)->MutableData();
++            for (unsigned i = 0; i < frames; ++i) {
++              buf[i] += noise;
++            }
++          }
++        }
++      }
++    }
++    // ==============================================
++
++
+     // in-place processing was not possible - so copy
+     destination_bus->CopyFrom(*rendered_bus);
+   }
+diff --git a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+index a16140fb73c2aa81eebb80bb156394bc5c766432..3b0eb8435f38dbae5be7993079ae0a473e67240b 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+@@ -5,11 +5,13 @@
+ #include "third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.h"
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/containers/heap_array.h"
+ #include "base/numerics/checked_math.h"
+ #include "base/numerics/safe_conversions.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+ #include "third_party/blink/public/platform/web_graphics_context_3d_provider.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/webgl_any.h"
+@@ -4772,17 +4774,32 @@ ScriptValue WebGL2RenderingContextBase::getParameter(ScriptState* script_state,
+     return ScriptValue::CreateNull(script_state->GetIsolate());
+   switch (pname) {
+     case GL_SHADING_LANGUAGE_VERSION: {
++      // ##SPOOF: webglShadingLanguageVersion
++      std::optional<std::string> config_shading_lang =
++          base::weblim::GetFingerprintConfigString(
++              "webglShadingLanguageVersion");
++      if (config_shading_lang.has_value() && !config_shading_lang->empty()) {
++        return WebGLAny(script_state,
++                        String::FromUTF8(*config_shading_lang));
++      }
+       return WebGLAny(
+           script_state,
+           StrCat({"WebGL GLSL ES 3.00 (",
+                   String(ContextGL()->GetString(GL_SHADING_LANGUAGE_VERSION)),
+                   ")"}));
+     }
+-    case GL_VERSION:
++    case GL_VERSION: {
++      // ##SPOOF: webglVersion
++      std::optional<std::string> config_version =
++          base::weblim::GetFingerprintConfigString("webglVersion");
++      if (config_version.has_value() && !config_version->empty()) {
++        return WebGLAny(script_state, String::FromUTF8(*config_version));
++      }
+       return WebGLAny(
+           script_state,
+           StrCat({"WebGL 2.0 (", String(ContextGL()->GetString(GL_VERSION)),
+                   ")"}));
++    }
+ 
+     case GL_COPY_READ_BUFFER_BINDING:
+       return WebGLAny(script_state, bound_copy_read_buffer_.Get());
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 773db104f3948c098a817aba8d3bf292057f3f51..97bf1e42e3c219eac6682bad28ea6af3b363dfd4 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -25,7 +25,9 @@
+ 
+ #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
+ 
++
+ #include <memory>
++#include <optional>
+ #include <utility>
+ 
+ #include "base/bit_cast.h"
+@@ -40,6 +42,7 @@
+ #include "base/synchronization/lock.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_event.h"
++#include "base/weblim/fingerprint_config.h"
+ #include "build/build_config.h"
+ #include "device/vr/buildflags/buildflags.h"
+ #include "device/vr/public/mojom/vr_service.mojom-blink-forward.h"
+@@ -229,6 +232,88 @@ enum class WebGLANGLEImplementation {
+ constexpr base::TimeDelta kDurationBetweenRestoreAttempts = base::Seconds(1);
+ const int kMaxGLErrorsAllowedToConsole = 256;
+ 
++int GetWebGLFingerprintSeed() {
++  std::optional<int> config_seed =
++      base::weblim::GetFingerprintConfigInt("webglSeed");
++  if (config_seed.has_value()) {
++    return config_seed.value();
++  }
++  return 0;
++}
++
++int WebGLComponentsForFormat(GLenum format) {
++  switch (format) {
++    case GL_ALPHA:
++    case GL_LUMINANCE:
++      return 1;
++    case GL_LUMINANCE_ALPHA:
++      return 2;
++    case GL_RGB:
++      return 3;
++    case GL_RGBA:
++      return 4;
++    default:
++      return 0;
++  }
++}
++
++uint32_t WebGLNoiseHash(uint32_t seed, uint32_t value) {
++  value ^= seed + 0x9e3779b9u + (value << 6) + (value >> 2);
++  value ^= value >> 16;
++  value *= 0x7feb352du;
++  value ^= value >> 15;
++  value *= 0x846ca68bu;
++  value ^= value >> 16;
++  return value;
++}
++
++void ApplyWebGLReadPixelsNoise(GLint x,
++                               GLint y,
++                               GLsizei width,
++                               GLsizei height,
++                               GLenum format,
++                               GLenum type,
++                               uint8_t* data) {
++  int seed = GetWebGLFingerprintSeed();
++  if (seed == 0 || !data || width <= 0 || height <= 0) {
++    return;
++  }
++
++  if (type != GL_UNSIGNED_BYTE) {
++    return;
++  }
++
++  int components = WebGLComponentsForFormat(format);
++  if (components <= 0) {
++    return;
++  }
++
++  uint32_t normalized_seed = static_cast<uint32_t>(seed);
++  uint32_t origin_hash = WebGLNoiseHash(
++      normalized_seed,
++      static_cast<uint32_t>(x * 73856093u) ^
++          static_cast<uint32_t>(y * 19349663u) ^
++          static_cast<uint32_t>(width * 83492791u) ^
++          static_cast<uint32_t>(height * 2654435761u));
++
++  uint32_t pixel_count = static_cast<uint32_t>(width) *
++                         static_cast<uint32_t>(height);
++  uint32_t step = 53u + (origin_hash % 29u);
++  uint32_t start = origin_hash % step;
++
++  for (uint32_t pixel = start; pixel < pixel_count; pixel += step) {
++    uint8_t* px = data + (pixel * static_cast<uint32_t>(components));
++    int mutable_components = components == 4 ? 3 : components;
++
++    for (int channel = 0; channel < mutable_components; ++channel) {
++      uint32_t h = WebGLNoiseHash(origin_hash, pixel * 17u + channel);
++      if ((h & 7u) == 0u) {
++        px[channel] = static_cast<uint8_t>(px[channel] ^ 1u);
++      }
++    }
++  }
++}
++
+ base::Lock& WebGLContextLimitLock() {
+   DEFINE_THREAD_SAFE_STATIC_LOCAL(base::Lock, lock, ());
+   return lock;
+@@ -3855,12 +3940,33 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_RENDERBUFFER_SIZE:
++    case GL_MAX_RENDERBUFFER_SIZE: {
++      // ## SPOOF: gpuRenderBufferLimit
++      std::optional<int> config_rbo =
++          base::weblim::GetFingerprintConfigInt("gpuRenderBufferLimit");
++      if (config_rbo.has_value() && config_rbo.value() > 0) {
++        return WebGLAny(script_state, config_rbo.value());
++      }
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_TEXTURE_IMAGE_UNITS:
++    }
++    case GL_MAX_TEXTURE_IMAGE_UNITS: {
++      // ## SPOOF: gpuTextureUnits
++      std::optional<int> config_tunits =
++          base::weblim::GetFingerprintConfigInt("gpuTextureUnits");
++      if (config_tunits.has_value() && config_tunits.value() > 0) {
++        return WebGLAny(script_state, config_tunits.value());
++      }
+       return GetIntParameter(script_state, pname);
+-    case GL_MAX_TEXTURE_SIZE:
++    }
++    case GL_MAX_TEXTURE_SIZE: {
++      // ## SPOOF: gpuTextureLimit
++      std::optional<int> config_tex =
++          base::weblim::GetFingerprintConfigInt("gpuTextureLimit");
++      if (config_tex.has_value() && config_tex.value() > 0) {
++        return WebGLAny(script_state, config_tex.value());
++      }
+       return GetIntParameter(script_state, pname);
++    }
+     case GL_MAX_VARYING_VECTORS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_ATTRIBS:
+@@ -3901,12 +4007,21 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return GetWebGLIntArrayParameter(script_state, pname);
+     case GL_SCISSOR_TEST:
+       return GetBooleanParameter(script_state, pname);
+-    case GL_SHADING_LANGUAGE_VERSION:
++    case GL_SHADING_LANGUAGE_VERSION: {
++      // ##SPOOF: webglShadingLanguageVersion
++      std::optional<std::string> config_shading_lang =
++          base::weblim::GetFingerprintConfigString(
++              "webglShadingLanguageVersion");
++      if (config_shading_lang.has_value() && !config_shading_lang->empty()) {
++        return WebGLAny(script_state,
++                        String::FromUTF8(*config_shading_lang));
++      }
+       return WebGLAny(
+           script_state,
+           StrCat({"WebGL GLSL ES 1.0 (",
+                   String(ContextGL()->GetString(GL_SHADING_LANGUAGE_VERSION)),
+                   ")"}));
++    }
+     case GL_STENCIL_BACK_FAIL:
+       return GetUnsignedIntParameter(script_state, pname);
+     case GL_STENCIL_BACK_FUNC:
+@@ -3963,11 +4078,18 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return WebGLAny(script_state, unpack_colorspace_conversion_);
+     case GL_VENDOR:
+       return WebGLAny(script_state, String("WebKit"));
+-    case GL_VERSION:
++    case GL_VERSION: {
++      // ##SPOOF: webglVersion
++      std::optional<std::string> config_version =
++          base::weblim::GetFingerprintConfigString("webglVersion");
++      if (config_version.has_value() && !config_version->empty()) {
++        return WebGLAny(script_state, String::FromUTF8(*config_version));
++      }
+       return WebGLAny(
+           script_state,
+           StrCat({"WebGL 1.0 (", String(ContextGL()->GetString(GL_VERSION)),
+                   ")"}));
++    }
+     case GL_VIEWPORT:
+       return GetWebGLIntArrayParameter(script_state, pname);
+     case GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES:  // OES_standard_derivatives
+@@ -3980,6 +4102,12 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        // ##SPOOF: gpuRenderer
++        std::optional<std::string> config_renderer =
++            base::weblim::GetFingerprintConfigString("gpuRenderer");
++        if (config_renderer.has_value() && !config_renderer->empty()) {
++          return WebGLAny(script_state, String::FromUTF8(*config_renderer));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_RENDERER)));
+       }
+@@ -3989,6 +4117,12 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        // ##SPOOF: gpuVendor
++        std::optional<std::string> config_vendor =
++            base::weblim::GetFingerprintConfigString("gpuVendor");
++        if (config_vendor.has_value() && !config_vendor->empty()) {
++          return WebGLAny(script_state, String::FromUTF8(*config_vendor));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_VENDOR)));
+       }
+@@ -4290,6 +4424,39 @@ WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
+   GLint precision = 0;
+   ContextGL()->GetShaderPrecisionFormat(shader_type, precision_type, range,
+                                         &precision);
++
++  // ===================================================
++  // === ## SPOOF: deterministic WebGL precision jitter
++  // ===================================================
++  {
++    std::optional<int> config_seed =
++        base::weblim::GetFingerprintConfigInt("webglSeed");
++
++    int seed = config_seed.value_or(0);
++
++    if (seed != 0) {
++      int j1 = (seed * 17) % 3;  // small jitter
++      int j2 = (seed * 23) % 3;
++      int j3 = (seed * 47) % 5;
++
++      range[0] += j1;
++      range[1] += j2;
++      precision += j3;
++
++      // Safety clamps
++      if (range[0] < -999) {
++        range[0] = -999;
++      }
++      if (range[1] < 0) {
++        range[1] = 0;
++      }
++      if (precision < 0) {
++        precision = 0;
++      }
++    }
++  }
++  // ===================================================
++
+   return MakeGarbageCollected<WebGLShaderPrecisionFormat>(range[0], range[1],
+                                                           precision);
+ }
+@@ -5132,6 +5299,8 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+       return;
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
++    ApplyWebGLReadPixelsNoise(x, y, width, height, format, type, data);
++
+   }
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+index 6039644e2dbdb129f89ccf0d4163b3dc160d9853..89aad9cc56089e86f9a5599882a5bce26b18fd97 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
+ 
++#include "base/weblim/fingerprint_config.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
+@@ -122,14 +123,42 @@ GPUAdapter::GPUAdapter(
+ 
+ GPUAdapterInfo* GPUAdapter::CreateAdapterInfoForAdapter() {
+   bool is_fallback_adapter = adapter_type_ == wgpu::AdapterType::CPU;
++  String vendor = vendor_;
++  String architecture = architecture_;
++  String device = device_;
++  String description = description_;
++
++  std::optional<std::string> config_vendor =
++      base::weblim::GetFingerprintConfigString("webgpuVendor");
++  if (config_vendor.has_value() && !config_vendor->empty()) {
++    vendor = String::FromUTF8(*config_vendor);
++  }
++
++  std::optional<std::string> config_architecture =
++      base::weblim::GetFingerprintConfigString("webgpuArchitecture");
++  if (config_architecture.has_value() && !config_architecture->empty()) {
++    architecture = String::FromUTF8(*config_architecture);
++  }
++
++  std::optional<std::string> config_device =
++      base::weblim::GetFingerprintConfigString("webgpuDevice");
++  if (config_device.has_value() && !config_device->empty()) {
++    device = String::FromUTF8(*config_device);
++  }
++
++  std::optional<std::string> config_description =
++      base::weblim::GetFingerprintConfigString("webgpuDescription");
++  if (config_description.has_value() && !config_description->empty()) {
++    description = String::FromUTF8(*config_description);
++  }
+ 
+   GPUAdapterInfo* info;
+   if (RuntimeEnabledFeatures::WebGPUDeveloperFeaturesEnabled()) {
+     // If WebGPU developer features have been enabled then provide all available
+     // adapter info values.
+     info = MakeGarbageCollected<GPUAdapterInfo>(
+-        vendor_, architecture_, subgroup_min_size_, subgroup_max_size_,
+-        is_fallback_adapter, device_, description_, driver_,
++        vendor, architecture, subgroup_min_size_, subgroup_max_size_,
++        is_fallback_adapter, device, description, driver_,
+         FromDawnEnum(backend_type_), FromDawnEnum(adapter_type_),
+         d3d_shader_model_, vk_driver_version_, FromDawnEnum(power_preference_));
+ 
+@@ -142,8 +171,8 @@ GPUAdapterInfo* GPUAdapter::CreateAdapterInfoForAdapter() {
+     }
+   } else {
+     info = MakeGarbageCollected<GPUAdapterInfo>(
+-        vendor_, architecture_, subgroup_min_size_, subgroup_max_size_,
+-        is_fallback_adapter);
++        vendor, architecture, subgroup_min_size_, subgroup_max_size_,
++        is_fallback_adapter, device, description);
+   }
+ 
+   // SAFETY: Required from caller

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Chromium Fingerprint Lab probe</title>
+<pre id="fingerprint"></pre>
+<script>
+  document.getElementById('fingerprint').textContent = JSON.stringify({
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    maxTouchPoints: navigator.maxTouchPoints,
+    navigatorPlatform: navigator.platform
+  });
+</script>
+</html>
